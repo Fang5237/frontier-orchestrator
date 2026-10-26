@@ -3,9 +3,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { z } from "zod";
 import { loadRuntimeConfig, resolveWorkingDirectory, type RuntimeConfig } from "./config.js";
 import { SpecialistCoordinator } from "./coordinator.js";
+import { resolveSpawnTarget } from "./process.js";
 import {
   buildCodexInvocation,
   buildGrokInvocation,
@@ -13,6 +17,7 @@ import {
   type DelegationMode,
   type DelegationRequest,
   type Specialist,
+  type SpecialistInvocation,
 } from "./specialists.js";
 
 const ANSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -90,7 +95,15 @@ function compactText(value: string, maximumCharacters: number): { text: string; 
 
 function commandVersion(command: string): Promise<{ available: boolean; version?: string; error?: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, ["--version"], {
+    let target: { command: string; args: string[] };
+    try {
+      target = resolveSpawnTarget(command, ["--version"]);
+    } catch (error) {
+      resolve({ available: false, error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+
+    const child = spawn(target.command, target.args, {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -146,8 +159,8 @@ function buildRequest(args: DelegateArguments): DelegationRequest {
 function failureHint(specialist: Specialist, stdout: string, stderr: string): string | undefined {
   const combined = `${stdout}\n${stderr}`;
 
-  if (specialist === "kimi-frontend" && /LLM not set|LLM is not set/i.test(combined)) {
-    return "Kimi has no configured model. Run `kimi login`, complete the provider/model setup, then retry.";
+  if (specialist === "kimi-frontend" && /LLM not set|LLM is not set|No model configured/i.test(combined)) {
+    return "Kimi has no configured model. Run `kimi login` or set default_model in the Kimi Code config.toml, then retry.";
   }
 
   if (/not logged in|authentication|unauthorized|401/i.test(combined)) {
@@ -171,10 +184,12 @@ async function delegate(
   coordinator: SpecialistCoordinator,
   signal: AbortSignal,
 ) {
+  let scratchDirectory: string | undefined;
+
   try {
     const workingDirectory = await resolveWorkingDirectory(args.working_directory, config);
     const request = buildRequest(args);
-    const invocation = (() => {
+    const invocation: SpecialistInvocation = await (async () => {
       switch (specialist) {
         case "codex-backend":
           return buildCodexInvocation(request, {
@@ -182,9 +197,11 @@ async function delegate(
             workingDirectory,
           });
         case "kimi-frontend":
+          scratchDirectory = await mkdtemp(path.join(tmpdir(), "frontier-kimi-"));
           return buildKimiInvocation(request, {
             cli: config.kimiCli,
             workingDirectory,
+            scratchDirectory,
           });
         case "grok-builder":
           return buildGrokInvocation(request, {
@@ -194,6 +211,10 @@ async function delegate(
       }
     })();
 
+    for (const file of invocation.files ?? []) {
+      await writeFile(file.path, file.content, "utf8");
+    }
+
     const result = await coordinator.run(
       invocation,
       args.timeout_seconds,
@@ -201,9 +222,22 @@ async function delegate(
       args.allow_concurrent_mutation,
       signal,
     );
-    const finalMessage = compactText(result.stdout, config.maxResultChars);
-    const diagnostics = compactText(result.stderr, Math.min(config.maxResultChars, 12_000));
-    const failed = result.exitCode !== 0 || result.timedOut || result.cancelled;
+    const extracted =
+      invocation.extractFinalMessage === undefined
+        ? result.stdout
+        : invocation.extractFinalMessage(result.stdout);
+    const failed =
+      result.exitCode !== 0 || result.timedOut || result.cancelled || extracted === undefined;
+    const finalMessage = compactText(extracted ?? "", config.maxResultChars);
+    const rawDiagnostics = [
+      result.stderr,
+      // Structured stdout is not returned as the final message, so keep it for debugging.
+      ...(invocation.extractFinalMessage === undefined ? [] : [result.stdout]),
+      ...(extracted === undefined ? ["Specialist exited without a final message."] : []),
+    ]
+      .filter((part) => part.trim() !== "")
+      .join("\n");
+    const diagnostics = compactText(rawDiagnostics, Math.min(config.maxResultChars, 12_000));
     const hint = failed ? failureHint(specialist, result.stdout, result.stderr) : undefined;
 
     const payload = {
@@ -236,6 +270,10 @@ async function delegate(
       content: [{ type: "text" as const, text: `Delegation failed: ${message}` }],
       isError: true,
     };
+  } finally {
+    if (scratchDirectory !== undefined) {
+      await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 

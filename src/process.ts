@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
+import path from "node:path";
 
 export interface CommandInvocation {
   command: string;
@@ -25,6 +27,68 @@ export interface RunCommandOptions {
   maxCapturedBytes: number;
   registry?: ActiveProcessRegistry;
   signal?: AbortSignal;
+}
+
+export function parseNpmCmdShim(content: string): string | undefined {
+  return content.match(/"(?:%dp0%[\\/]|%~dp0[\\/]?)([^"\r\n]+\.(?:js|mjs|cjs))"/i)?.[1];
+}
+
+function isFile(file: string): boolean {
+  try {
+    return statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function resolveSpawnTarget(
+  command: string,
+  args: string[],
+  options: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {},
+): { command: string; args: string[] } {
+  if (/\.(?:js|mjs|cjs)$/i.test(command)) {
+    return { command: process.execPath, args: [command, ...args] };
+  }
+
+  if ((options.platform ?? process.platform) !== "win32") {
+    return { command, args };
+  }
+
+  const env = options.env ?? process.env;
+  const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .filter((extension) => /^\.(?:COM|EXE|BAT|CMD)$/i.test(extension));
+  const candidates = /[\\/]/.test(command) || path.win32.extname(command) !== ""
+    ? [command]
+    : (env.PATH?.split(";") ?? []).flatMap((directory) =>
+      extensions.map((extension) => path.win32.join(directory, command + extension)),
+    );
+  const file = candidates.find(isFile);
+  if (file === undefined) {
+    return { command, args };
+  }
+
+  const extension = path.win32.extname(file).toLowerCase();
+  if (extension === ".exe" || extension === ".com") {
+    return { command: path.win32.resolve(file), args };
+  }
+
+  if (extension === ".cmd" || extension === ".bat") {
+    const relativeScript = parseNpmCmdShim(readFileSync(file, "utf8"));
+    if (relativeScript !== undefined) {
+      const script = path.win32.resolve(path.win32.dirname(file), relativeScript);
+      if (isFile(script)) {
+        return { command: process.execPath, args: [script, ...args] };
+      }
+    }
+
+    throw new Error(
+      "Node cannot spawn .cmd/.bat files without a shell: " + file +
+      ". Point the FRONTIER_*_CLI variable at the native executable or the JavaScript entry file.",
+    );
+  }
+
+  return { command, args };
 }
 
 class TailBuffer {
@@ -68,7 +132,25 @@ function terminateProcess(pid: number | undefined, signal: NodeJS.Signals): void
 
   try {
     if (process.platform === "win32") {
-      process.kill(pid, signal);
+      // taskkill /T also ends grandchildren. If it is unavailable or denied,
+      // still end the direct child so timeouts and cancellation cannot hang.
+      const killDirectChild = () => {
+        try {
+          process.kill(pid, signal);
+        } catch {
+          // The process may already have exited.
+        }
+      };
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      })
+        .once("error", killDirectChild)
+        .once("exit", (code) => {
+          if (code !== 0) {
+            killDirectChild();
+          }
+        });
     } else {
       process.kill(-pid, signal);
     }
@@ -143,9 +225,11 @@ export async function runCommand(
   const stderr = new TailBuffer(options.maxCapturedBytes);
 
   return await new Promise<CommandResult>((resolve, reject) => {
-    const child = spawn(invocation.command, invocation.args, {
+    const env = invocation.env ?? process.env;
+    const target = resolveSpawnTarget(invocation.command, invocation.args, { env });
+    const child = spawn(target.command, target.args, {
       cwd: invocation.cwd,
-      env: invocation.env ?? process.env,
+      env,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
