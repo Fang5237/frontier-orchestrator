@@ -48,7 +48,7 @@ The MCP server exposes four tools:
 | `delegate_frontend` | Send a bounded design/frontend task to Kimi (`analyze` / `review` / `implement`) |
 | `delegate_build` | Send domain-neutral tooling or mechanical maintenance to Grok Build (`analyze` / `review` / `implement`) |
 
-Each delegation takes a structured request — `task`, `mode`, `context`, `file_scope`, `acceptance_criteria`, optional `model` override, and a hard `timeout_seconds` — and returns JSON with the specialist's final message, exit code, duration, and diagnostics on failure.
+Each delegation takes a structured request — `task`, `mode`, `context`, `file_scope`, `acceptance_criteria`, optional `model` override, and a hard `timeout_seconds` (default 3600, max 7200) — and returns JSON with the specialist's final message, exit code, duration, and diagnostics on failure.
 
 The companion **`orchestrate-specialists` skill** (in `.claude/skills/`) teaches Claude the domain-first routing rules, backend-first and frontend-first sequencing patterns, Grok's tooling and maintenance boundary, parallelization preconditions, and guardrails (see [routing-contract.md](.claude/skills/orchestrate-specialists/references/routing-contract.md)).
 
@@ -91,6 +91,8 @@ mkdir -p ~/.claude/skills
 cp -R .claude/skills/orchestrate-specialists ~/.claude/skills/
 ```
 
+`claude mcp add` does not set a tool-call timeout. Add `"timeout": 7500000` to the `frontier-orchestrator` entry under `mcpServers` in `~/.claude.json`, matching the project `.mcp.json`; otherwise slow specialists such as Codex at high reasoning effort can be cut off by the client before their own `timeout_seconds` expires.
+
 Restart Claude Code after changing MCP configuration.
 
 ## Example delegation
@@ -117,6 +119,8 @@ The server inherits existing Codex, Kimi, and Grok authentication from their CLI
 | `FRONTIER_MAX_CONCURRENCY` | `2` | Maximum simultaneous specialist processes |
 | `FRONTIER_MAX_CAPTURED_BYTES` | `2000000` | Per-stream child output retained in memory |
 | `FRONTIER_MAX_RESULT_CHARS` | `30000` | Maximum specialist text returned to Claude |
+
+Keep the MCP client `timeout` (milliseconds) above the 7200-second `timeout_seconds` maximum so the server, not the client, ends an overrunning specialist and returns its partial output. If the client cancels a request anyway, the server terminates the specialist process and releases its workspace lock.
 
 Implementation calls are serialized per working directory unless Claude explicitly sets `allow_concurrent_mutation: true`. The skill only permits that when file scopes are disjoint and the cross-stack contract is stable.
 

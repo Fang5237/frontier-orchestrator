@@ -14,6 +14,7 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  cancelled: boolean;
   durationMs: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
@@ -23,6 +24,7 @@ export interface RunCommandOptions {
   timeoutMs: number;
   maxCapturedBytes: number;
   registry?: ActiveProcessRegistry;
+  signal?: AbortSignal;
 }
 
 class TailBuffer {
@@ -151,34 +153,54 @@ export async function runCommand(
     const releaseProcess = options.registry?.track(child);
 
     let timedOut = false;
+    let cancelled = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
 
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    const stop = () => {
+      if (forceKillTimer !== undefined) {
+        return;
+      }
       terminateProcess(child.pid, "SIGTERM");
       forceKillTimer = setTimeout(() => terminateProcess(child.pid, "SIGKILL"), 2_000);
       forceKillTimer.unref();
+    };
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      stop();
     }, options.timeoutMs);
     timeout.unref();
+
+    // The MCP client cancels the request when it stops waiting; without this the
+    // specialist would keep editing files and holding its concurrency slot.
+    const onAbort = () => {
+      cancelled = true;
+      stop();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted === true) {
+      onAbort();
+    }
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (forceKillTimer !== undefined) {
+        clearTimeout(forceKillTimer);
+      }
+      options.signal?.removeEventListener("abort", onAbort);
+      releaseProcess?.();
+    };
 
     child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
 
     child.once("error", (error) => {
-      clearTimeout(timeout);
-      if (forceKillTimer !== undefined) {
-        clearTimeout(forceKillTimer);
-      }
-      releaseProcess?.();
+      cleanup();
       reject(error);
     });
 
     child.once("close", (exitCode, signal) => {
-      clearTimeout(timeout);
-      if (forceKillTimer !== undefined) {
-        clearTimeout(forceKillTimer);
-      }
-      releaseProcess?.();
+      cleanup();
 
       resolve({
         exitCode,
@@ -186,6 +208,7 @@ export async function runCommand(
         stdout: stdout.toString(),
         stderr: stderr.toString(),
         timedOut,
+        cancelled,
         durationMs: Date.now() - startedAt,
         stdoutTruncated: stdout.truncated,
         stderrTruncated: stderr.truncated,

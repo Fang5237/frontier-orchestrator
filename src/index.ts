@@ -48,9 +48,11 @@ const delegationInput = {
     .number()
     .int()
     .min(30)
-    .max(3_600)
-    .default(1_200)
-    .describe("Hard timeout for the specialist CLI process."),
+    .max(7_200)
+    .default(3_600)
+    .describe(
+      "Hard timeout for the specialist CLI process. The MCP client timeout is configured above the 7200-second maximum, so any allowed value is honored.",
+    ),
   allow_concurrent_mutation: z
     .boolean()
     .default(false)
@@ -167,6 +169,7 @@ async function delegate(
   args: DelegateArguments,
   config: RuntimeConfig,
   coordinator: SpecialistCoordinator,
+  signal: AbortSignal,
 ) {
   try {
     const workingDirectory = await resolveWorkingDirectory(args.working_directory, config);
@@ -196,10 +199,11 @@ async function delegate(
       args.timeout_seconds,
       args.mode === "implement",
       args.allow_concurrent_mutation,
+      signal,
     );
     const finalMessage = compactText(result.stdout, config.maxResultChars);
     const diagnostics = compactText(result.stderr, Math.min(config.maxResultChars, 12_000));
-    const failed = result.exitCode !== 0 || result.timedOut;
+    const failed = result.exitCode !== 0 || result.timedOut || result.cancelled;
     const hint = failed ? failureHint(specialist, result.stdout, result.stderr) : undefined;
 
     const payload = {
@@ -209,6 +213,7 @@ async function delegate(
       exit_code: result.exitCode,
       signal: result.signal,
       timed_out: result.timedOut,
+      cancelled: result.cancelled,
       duration_ms: result.durationMs,
       output_truncated: finalMessage.truncated || result.stdoutTruncated,
       final_message: finalMessage.text,
@@ -303,8 +308,8 @@ async function main(): Promise<void> {
         idempotentHint: false,
       },
     },
-    async (args) =>
-      await delegate("codex-backend", args as DelegateArguments, config, coordinator),
+    async (args, extra) =>
+      await delegate("codex-backend", args as DelegateArguments, config, coordinator, extra.signal),
   );
 
   server.registerTool(
@@ -320,8 +325,8 @@ async function main(): Promise<void> {
         idempotentHint: false,
       },
     },
-    async (args) =>
-      await delegate("kimi-frontend", args as DelegateArguments, config, coordinator),
+    async (args, extra) =>
+      await delegate("kimi-frontend", args as DelegateArguments, config, coordinator, extra.signal),
   );
 
   server.registerTool(
@@ -337,8 +342,8 @@ async function main(): Promise<void> {
         idempotentHint: false,
       },
     },
-    async (args) =>
-      await delegate("grok-builder", args as DelegateArguments, config, coordinator),
+    async (args, extra) =>
+      await delegate("grok-builder", args as DelegateArguments, config, coordinator, extra.signal),
   );
 
   const transport = new StdioServerTransport();

@@ -97,11 +97,16 @@ export class SpecialistCoordinator {
     timeoutSeconds: number,
     mutatesWorkspace: boolean,
     allowConcurrentMutation: boolean,
+    signal?: AbortSignal,
   ): Promise<CommandResult> {
     const releaseConcurrency = await this.concurrency.acquire();
     let releaseMutation: (() => void) | undefined;
 
     try {
+      if (signal?.aborted === true) {
+        throw new Error("Delegation was cancelled by the MCP client before the specialist started.");
+      }
+
       if (mutatesWorkspace) {
         releaseMutation = this.mutations.acquire(invocation.cwd, allowConcurrentMutation);
       }
@@ -110,6 +115,7 @@ export class SpecialistCoordinator {
         timeoutMs: timeoutSeconds * 1_000,
         maxCapturedBytes: this.config.maxCapturedBytes,
         registry: this.processes,
+        ...(signal === undefined ? {} : { signal }),
       });
     } finally {
       releaseMutation?.();
