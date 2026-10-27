@@ -18,6 +18,8 @@ export interface SpecialistInvocation extends CommandInvocation {
   files?: Array<{ path: string; content: string }>;
   /** Converts raw stdout into the final message. Returns undefined when no final message exists. */
   extractFinalMessage?: (stdout: string) => string | undefined;
+  /** True when the CLI writes output while it works, so prolonged silence means it is stuck. */
+  reportsProgress?: boolean;
 }
 
 interface InvocationOptions {
@@ -133,7 +135,7 @@ ${request.context?.trim() || "No additional context was supplied."}
 export function buildCodexInvocation(
   request: DelegationRequest,
   options: InvocationOptions,
-): CommandInvocation {
+): SpecialistInvocation {
   const args = [
     "exec",
     "--ephemeral",
@@ -157,6 +159,8 @@ export function buildCodexInvocation(
     args,
     cwd: options.workingDirectory,
     stdin: buildSpecialistPrompt("codex-backend", request, options.workingDirectory),
+    // codex exec streams its transcript (messages, commands, results) to stderr.
+    reportsProgress: true,
   };
 }
 
@@ -194,6 +198,8 @@ export function buildKimiInvocation(
     cwd: options.workingDirectory,
     ...(files.length > 0 ? { files } : {}),
     extractFinalMessage: extractKimiFinalMessage,
+    // stream-json emits one line per message and tool result.
+    reportsProgress: true,
   };
 }
 

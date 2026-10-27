@@ -121,8 +121,11 @@ The server inherits existing Codex, Kimi, and Grok authentication from their CLI
 | `FRONTIER_MAX_CONCURRENCY` | `2` | Maximum simultaneous specialist processes |
 | `FRONTIER_MAX_CAPTURED_BYTES` | `2000000` | Per-stream child output retained in memory |
 | `FRONTIER_MAX_RESULT_CHARS` | `30000` | Maximum specialist text returned to Claude |
+| `FRONTIER_IDLE_TIMEOUT_SECONDS` | `900` | Stop Codex or Kimi after this many seconds without any output; `0` disables. Grok's plain output arrives only at the end, so it is exempt |
 
 Keep the MCP client `timeout` (milliseconds) above the 7200-second `timeout_seconds` maximum so the server, not the client, ends an overrunning specialist and returns its partial output. If the client cancels a request anyway, the server terminates the specialist process and releases its workspace lock.
+
+`timeout_seconds` is a ceiling, not a budget. Stuck Codex and Kimi runs are caught by the idle limit instead, so delegations should keep the default rather than shortening it or splitting work by time. When a run does hit a limit, the result includes `timed_out` or `idle_timed_out` and a hint to inspect the partial work and delegate only what remains.
 
 Implementation calls are serialized per working directory unless Claude explicitly sets `allow_concurrent_mutation: true`. The skill only permits that when file scopes are disjoint and the cross-stack contract is stable.
 

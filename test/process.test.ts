@@ -309,3 +309,47 @@ test("runCommand terminates grandchildren when the request signal aborts", async
     await running;
   }
 });
+
+test("runCommand stops a command that goes silent for the idle timeout", async () => {
+  const startedAt = Date.now();
+  const result = await runCommand(
+    {
+      command: process.execPath,
+      args: ["-e", 'console.log("started"); setInterval(() => {}, 1000)'],
+      cwd: process.cwd(),
+    },
+    {
+      timeoutMs: 10_000,
+      idleTimeoutMs: 300,
+      maxCapturedBytes: 10_000,
+    },
+  );
+
+  assert.equal(result.idleTimedOut, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.cancelled, false);
+  assert.match(result.stdout, /started/);
+  assert.ok(Date.now() - startedAt < 5_000);
+});
+
+test("runCommand keeps a command alive while it produces output", async () => {
+  const result = await runCommand(
+    {
+      command: process.execPath,
+      args: [
+        "-e",
+        'let n = 0; const t = setInterval(() => { console.error("tick"); if (++n === 8) { clearInterval(t); console.log("done"); } }, 100)',
+      ],
+      cwd: process.cwd(),
+    },
+    {
+      timeoutMs: 10_000,
+      idleTimeoutMs: 400,
+      maxCapturedBytes: 10_000,
+    },
+  );
+
+  assert.equal(result.idleTimedOut, false);
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /done/);
+});

@@ -16,6 +16,7 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  idleTimedOut: boolean;
   cancelled: boolean;
   durationMs: number;
   stdoutTruncated: boolean;
@@ -24,6 +25,8 @@ export interface CommandResult {
 
 export interface RunCommandOptions {
   timeoutMs: number;
+  /** Stop the command when it writes nothing to stdout or stderr for this long. */
+  idleTimeoutMs?: number;
   maxCapturedBytes: number;
   registry?: ActiveProcessRegistry;
   signal?: AbortSignal;
@@ -236,31 +239,32 @@ export async function runCommand(
     });
     const releaseProcess = options.registry?.track(child);
 
-    let timedOut = false;
-    let cancelled = false;
+    let stopReason: "timeout" | "idle" | "cancelled" | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
 
-    const stop = () => {
-      if (forceKillTimer !== undefined) {
+    const stop = (reason: "timeout" | "idle" | "cancelled") => {
+      if (stopReason !== undefined) {
         return;
       }
+      stopReason = reason;
       terminateProcess(child.pid, "SIGTERM");
       forceKillTimer = setTimeout(() => terminateProcess(child.pid, "SIGKILL"), 2_000);
       forceKillTimer.unref();
     };
 
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      stop();
-    }, options.timeoutMs);
+    const timeout = setTimeout(() => stop("timeout"), options.timeoutMs);
     timeout.unref();
+
+    // A specialist that keeps producing output is working; silence means it is stuck.
+    const idleTimer =
+      options.idleTimeoutMs === undefined
+        ? undefined
+        : setTimeout(() => stop("idle"), options.idleTimeoutMs);
+    idleTimer?.unref();
 
     // The MCP client cancels the request when it stops waiting; without this the
     // specialist would keep editing files and holding its concurrency slot.
-    const onAbort = () => {
-      cancelled = true;
-      stop();
-    };
+    const onAbort = () => stop("cancelled");
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted === true) {
       onAbort();
@@ -268,6 +272,7 @@ export async function runCommand(
 
     const cleanup = () => {
       clearTimeout(timeout);
+      clearTimeout(idleTimer);
       if (forceKillTimer !== undefined) {
         clearTimeout(forceKillTimer);
       }
@@ -275,8 +280,14 @@ export async function runCommand(
       releaseProcess?.();
     };
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout.append(chunk);
+      idleTimer?.refresh();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr.append(chunk);
+      idleTimer?.refresh();
+    });
 
     child.once("error", (error) => {
       cleanup();
@@ -291,8 +302,9 @@ export async function runCommand(
         signal,
         stdout: stdout.toString(),
         stderr: stderr.toString(),
-        timedOut,
-        cancelled,
+        timedOut: stopReason === "timeout",
+        idleTimedOut: stopReason === "idle",
+        cancelled: stopReason === "cancelled",
         durationMs: Date.now() - startedAt,
         stdoutTruncated: stdout.truncated,
         stderrTruncated: stderr.truncated,

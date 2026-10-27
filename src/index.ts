@@ -56,7 +56,7 @@ const delegationInput = {
     .max(7_200)
     .default(3_600)
     .describe(
-      "Hard timeout for the specialist CLI process. The MCP client timeout is configured above the 7200-second maximum, so any allowed value is honored.",
+      "Hard limit on the specialist's total runtime. Keep the default; raise it toward 7200 for large implementations. Do not shorten it or split work to fit a time budget: Codex and Kimi are already stopped early when they produce no output for the server's idle limit (default 900 seconds), so a long limit costs nothing on a stuck run. Values up to the maximum are honored by the MCP client.",
     ),
   allow_concurrent_mutation: z
     .boolean()
@@ -156,8 +156,30 @@ function buildRequest(args: DelegateArguments): DelegationRequest {
   };
 }
 
-function failureHint(specialist: Specialist, stdout: string, stderr: string): string | undefined {
-  const combined = `${stdout}\n${stderr}`;
+function stopHint(
+  result: { timedOut: boolean; idleTimedOut: boolean },
+  timeoutSeconds: number,
+  idleTimeoutSeconds: number,
+): string | undefined {
+  const resume =
+    "Edits made before the stop remain in the workspace, and final_message shows the last progress report. " +
+    "Inspect the changes, then delegate only the remaining work instead of restarting or splitting the original task further.";
+
+  if (result.timedOut) {
+    return `The specialist was still working when timeout_seconds (${timeoutSeconds}) expired. ${resume} Give the follow-up a larger timeout_seconds.`;
+  }
+
+  if (result.idleTimedOut) {
+    return `The specialist produced no output for ${idleTimeoutSeconds} seconds and was stopped as stuck. ${resume} If it was blocked on a long silent command, ask it to run that command in the background or skip it.`;
+  }
+
+  return undefined;
+}
+
+// Scan only what the specialist reported, not the full stdout: Kimi's stdout is an event
+// stream that includes file contents, which would trigger false authentication hints.
+function failureHint(specialist: Specialist, finalMessage: string, stderr: string): string | undefined {
+  const combined = `${finalMessage}\n${stderr}`;
 
   if (specialist === "kimi-frontend" && /LLM not set|LLM is not set|No model configured/i.test(combined)) {
     return "Kimi has no configured model. Run `kimi login` or set default_model in the Kimi Code config.toml, then retry.";
@@ -215,19 +237,27 @@ async function delegate(
       await writeFile(file.path, file.content, "utf8");
     }
 
-    const result = await coordinator.run(
-      invocation,
-      args.timeout_seconds,
-      args.mode === "implement",
-      args.allow_concurrent_mutation,
+    const idleTimeoutSeconds =
+      invocation.reportsProgress === true && config.idleTimeoutSeconds > 0
+        ? config.idleTimeoutSeconds
+        : undefined;
+    const result = await coordinator.run(invocation, {
+      timeoutSeconds: args.timeout_seconds,
+      ...(idleTimeoutSeconds === undefined ? {} : { idleTimeoutSeconds }),
+      mutatesWorkspace: args.mode === "implement",
+      allowConcurrentMutation: args.allow_concurrent_mutation,
       signal,
-    );
+    });
     const extracted =
       invocation.extractFinalMessage === undefined
         ? result.stdout
         : invocation.extractFinalMessage(result.stdout);
     const failed =
-      result.exitCode !== 0 || result.timedOut || result.cancelled || extracted === undefined;
+      result.exitCode !== 0 ||
+      result.timedOut ||
+      result.idleTimedOut ||
+      result.cancelled ||
+      extracted === undefined;
     const finalMessage = compactText(extracted ?? "", config.maxResultChars);
     const rawDiagnostics = [
       result.stderr,
@@ -238,7 +268,10 @@ async function delegate(
       .filter((part) => part.trim() !== "")
       .join("\n");
     const diagnostics = compactText(rawDiagnostics, Math.min(config.maxResultChars, 12_000));
-    const hint = failed ? failureHint(specialist, result.stdout, result.stderr) : undefined;
+    const hint = failed
+      ? stopHint(result, args.timeout_seconds, idleTimeoutSeconds ?? 0) ??
+        failureHint(specialist, extracted ?? "", result.stderr)
+      : undefined;
 
     const payload = {
       specialist,
@@ -247,6 +280,7 @@ async function delegate(
       exit_code: result.exitCode,
       signal: result.signal,
       timed_out: result.timedOut,
+      idle_timed_out: result.idleTimedOut,
       cancelled: result.cancelled,
       duration_ms: result.durationMs,
       output_truncated: finalMessage.truncated || result.stdoutTruncated,

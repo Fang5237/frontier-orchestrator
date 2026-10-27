@@ -31,6 +31,7 @@ test("Codex implementation uses workspace-write and stdin", () => {
   assert.equal(invocation.args.at(-1), "-");
   assert.match(invocation.stdin ?? "", /backend specialist/);
   assert.match(invocation.stdin ?? "", /Contract handoff/);
+  assert.equal(invocation.reportsProgress, true);
 });
 
 test("Codex analysis uses a read-only sandbox", () => {
@@ -58,6 +59,7 @@ for (const mode of ["analyze", "review", "implement"] as const) {
     assert.equal(invocation.stdin, undefined);
     assert.ok(!Object.hasOwn(invocation, "stdin"));
     assert.equal(invocation.extractFinalMessage, extractKimiFinalMessage);
+    assert.equal(invocation.reportsProgress, true);
     assert.equal(
       invocation.args[invocation.args.indexOf("-p") + 1],
       buildSpecialistPrompt("kimi-frontend", modeRequest, kimiOptions.workingDirectory),
@@ -269,6 +271,8 @@ test("Grok implementation uses a workspace sandbox and a domain-neutral prompt",
   });
 
   assert.equal(invocation.command, "grok-custom");
+  // Plain output arrives only at the end, so silence is not a stuck signal.
+  assert.ok(!("reportsProgress" in invocation));
   assert.ok(invocation.args.includes("workspace"));
   assert.ok(invocation.args.includes("bypassPermissions"));
   assert.ok(invocation.args.includes("--no-memory"));
